@@ -1,0 +1,51 @@
+{
+  "$comment": "pi-bridge 配置示例 —— 复制到 ~/.pi-bridge/config.json 后按需修改。所有字段均可省略，省略即用内置默认。",
+
+  "$comment_piExe": "Pi 可执行文件路径。省略则按 PATH 查找 `pi`（Windows 上尝试 pi.exe）。",
+  "piExe": "/path/to/pi",
+
+  "$comment_aliases": "模型别名表：别名 → { provider, model }。provider 必须已存在于 Pi 的 models.json 中。",
+  "$comment_localConvention": "命名约定：provider 以 `local-` 开头 = 本地模型（占显存、串行排队）；其它 = 云端/网关（不限并发、可真并行）。",
+  "aliases": {
+    "local-fast": { "provider": "local-fast", "model": "local-model" },
+    "local-main": { "provider": "local-main", "model": "local-model" },
+    "cloud-fast": { "provider": "my-gateway", "model": "auto-fast" },
+    "cloud-best": { "provider": "my-gateway", "model": "auto-best" }
+  },
+
+  "$comment_routing": "任务类型 → 默认别名。调用方不指定 model 时按此路由。",
+  "routing": {
+    "coding": "local-main",
+    "analysis": "local-main",
+    "research": "local-main",
+    "review": "local-main",
+    "quick": "local-fast",
+    "text": "local-main",
+    "stable": "local-fast",
+    "cloud": "cloud-fast",
+    "cloud_fast": "cloud-fast",
+    "cloud_best": "cloud-best"
+  },
+
+  "$comment_probeUrls": "端点存活探测 URL（可选）。配置后才能在「引擎未启动」时先探活再回退，避免白白等待。",
+  "probeUrls": {
+    "local-main": "http://127.0.0.1:8000/v1/models",
+    "cloud-fast": "http://127.0.0.1:3456/v1/models"
+  },
+
+  "$comment_concurrency": "本地模型并发闸门（占显存者）。单卡一般保持 1；大显存机器可调大。",
+  "maxConcurrent": 1,
+
+  "$comment_timeout": "单任务默认超时（毫秒）。",
+  "timeoutMs": 600000,
+
+  "$comment_verifyShell": "验收命令使用哪个 shell。省略则 Windows=cmd.exe / POSIX=/bin/sh。",
+  "verifyShell": "",
+
+  "$comment_sessionrelay": "【可选】项目上下文注入。不配则完全跳过（零打扰）。仅在接入 SessionRelay 生态时需要。",
+  "srelayPath": "",
+  "briefShared": "",
+
+  "$comment_nodeBin": "【可选】spawn srelay 所用的 node 路径。仅在配置了 sessionrelay 时需要。",
+  "nodeBin": ""
+}

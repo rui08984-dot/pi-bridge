@@ -1,0 +1,31 @@
+{
+  "name": "pi-bridge",
+  "version": "0.2.0",
+  "description": "Expose a Pi agent node as MCP tools: dispatch sub-tasks to local or cloud models, with command-based acceptance, evidence chains, and escalation on failure.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "pi-bridge": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "selftest": "node src/selftest.js",
+    "smoke": "node src/mcp-smoke.js",
+    "test": "node tests/verify-unit.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "pi",
+    "agent",
+    "task-dispatch",
+    "acceptance-testing",
+    "local-llm"
+  ]
+}
