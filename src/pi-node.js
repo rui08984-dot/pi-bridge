@@ -1,7 +1,7 @@
 /**
  * PiNode —— 单个 Pi RPC 进程的生命周期封装。
  *
- * 协议要点（对照 D:/llm/pi/docs/rpc.md 实测校正，勿凭记忆改）：
+ * 协议要点（对照 Pi 官方 docs/rpc.md 实测校正，勿凭记忆改）：
  *   - 字段名是 `message`，**不是** `content`
  *   - 命令带 `id` 才回带 `id` 的 `{"type":"response"}`；事件流无 id
  *   - agent_settled 才是「彻底干完」（agent_end 后可能还有重试/压缩/队列续跑）
@@ -11,8 +11,7 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-
-const PI_EXE = process.env.PI_EXE || "D:\\llm\\pi\\pi.exe";
+import { PI_EXE } from "./config.js";
 
 export class PiNode extends EventEmitter {
 	constructor({ taskId, cwd, provider, model = "local-model", thinking = null, excludeTools = null, allowTools = null }) {
@@ -69,15 +68,15 @@ export class PiNode extends EventEmitter {
 			this.emit("node-error", { taskId: this.taskId, error: String(err) });
 		});
 		this.proc.on("exit", (code) => {
-			// Bun 运行时的 OOM 退出码（Windows 上表现为 -4058 / 0xFFFFF018 一类）。
-			// 实测踩过：引擎把显存吃满后，pi.exe 连启动都起不来，stderr 却是空的——
-			// 光看「引擎在线」会被误导，必须专门提示显存。
+			// 退出码 134 / -4058 一类 = 运行时申请显存失败（本地大模型加载后余量极小）。
+			// 实测踩过：引擎把显存吃满后，pi 进程连启动都起不来，stderr 却是空的——
+			// 光看「引擎在线」会被误导，必须专门提示。
 			if (code !== 0 && code !== null) {
 				this.exitHint =
 					code === -4058 || code === 134
-						? `pi 进程启动即退出（exit=${code}），这是 Bun 运行时申请显存失败。` +
-						  `引擎已占满显存时就会这样——8GB 卡上本地引擎加载后余量极小。` +
-						  `处理：关掉占显存的程序（浏览器/QQ/Docker），或重启引擎。`
+						? `pi 进程启动即退出（exit=${code}），这是运行时申请显存失败。` +
+						  `本地引擎加载后显存余量不足时就会这样。` +
+						  `处理：关掉其它占显存的程序，或换更小的模型/量化档。`
 						: null;
 			}
 			// 非正常收尾（被 cancel/崩溃）时唤醒等待者，避免永久挂起

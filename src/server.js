@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * pi-bridge —— 把本地 Pi 执行节点暴露为 MCP 工具，让 ZCode 能派活/查状态/取消。
+ * pi-bridge —— 把 Pi 执行节点暴露为 MCP 工具，让任意 MCP 客户端（ZCode / Claude Code / Codex …）能派活、查状态、取消。
  *
  * 暴露三个工具（刻意保持精简）：
- *   pi_execute  派一个子任务给本地模型，跑完回传结构化结果
+ *   pi_execute  派一个子任务给指定模型，跑完回传结构化结果（async=true 则派发即返回）
  *   pi_status   列出所有在跑/已完成的任务状态表
  *   pi_cancel   取消指定任务
  *
  * 同时支持单次 CLI 模式便于命令行验收：
- *   node src/server.js exec "任务" --model=coding --dir=D:\repo
+ *   node src/server.js exec "任务" --model=coding --dir=/path/to/repo
+ *
+ * 配置：全部路径与模型表都可外置（见 README「配置」），代码不含个人环境硬编码。
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -28,6 +30,7 @@ import {
 	MODEL_ALIASES,
 } from "./models.js";
 import { runVerify, snapshot, diffSnapshots, checkScope, buildReworkPrompt, buildEvidence } from "./verify.js";
+import { MAX_CONCURRENT as CFG_MAX_CONCURRENT, DEFAULT_TIMEOUT_MS } from "./config.js";
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
@@ -138,13 +141,13 @@ function cancelledError(taskId) {
 /**
  * 并发闸门：**只管本地模型**。
  *
- * 本机 8GB VRAM，本地引擎一次只能跑一个 → 本地任务串行排队。
- * 但云端链（newapi）不占显存，**应当与本地模型真正并行**——
- * 所以闸门按 provider分流：local-* 进闸门，newapi 直接放行。
+ * 本地引擎一次只能跑一个（典型是单张显卡跑量化模型）→ 本地任务串行排队。
+ * 云端/网关模型不占本地显存，**应当与本地模型真正并行**——
+ * 所以闸门按 provider 分流：local-* 进闸门，其它直接放行。
  *
  * 于是「一个本地 + 一个云端」是真并行的，不是排队。
  */
-const MAX_CONCURRENT = Number(process.env.PI_BRIDGE_CONCURRENCY || 1);
+const MAX_CONCURRENT = CFG_MAX_CONCURRENT;
 let active = 0;
 const waiting = []; // {taskId, modelLabel, resolve, reject, cancelled}
 
@@ -197,14 +200,16 @@ const TOOLS = [
 	{
 		name: "pi_execute",
 		description: [
-			"【何时用】把子任务派给本地模型跑。本机 8GB 显卡上跑的是你自建的 NInfer/AtomicBot 量化模型（非 Ollama），不花 API 费、数据不出本机。",
-			"适合：大批量文本处理、代码审查、跑测试/构建、日志分析、本地批量改代码。",
+			"【何时用】把子任务派给另一个模型跑（本地自建模型，或你配置的云端/网关模型）。",
+			"适合：大批量文本处理、代码审查、跑测试/构建、日志分析、批量改代码——这些活派出去能给主会话省 token。",
 			"不适合：简单问答、几秒钟就能自己做完的小事——那种直接做更快。",
 			"",
-			"【重要·前置条件】本地模型引擎必须已经由用户手动启动（桌面快捷方式『启动本地AI-菜单』→ 选 9 或 10）。",
-			"本工具**不会**替你启动引擎。若返回 unreachable，说明引擎没开——请让用户先启动，不要重试。",
+			"【重要·前置条件】被派活的模型端点必须已就绪：",
+			"  · 本地模型 = 你需要先手动启动它的推理引擎（本工具不会替你拉进程）；",
+			"  · 云端模型 = 网关/API 可达即可（通常无需额外启动）。",
+			"若返回 unreachable，说明端点没起来——先启动它，不要反复重试。",
 			"",
-			"【强烈建议】带 verify 参数。本地量化模型会说『我做完了』但工具可能没真执行；",
+			"【强烈建议】带 verify 参数。弱模型会说『我做完了』但工具可能没真执行；",
 			"只有你给的验收命令跑出退出码 0 才算真完成。这是唯一可信的完成信号。",
 			"",
 			"【示例】",
@@ -212,7 +217,7 @@ const TOOLS = [
 			'pi_execute(task="分析 logs/ 里的报错", mode="explore")   // 只读，不会改任何文件',
 			'pi_execute(task="重构认证模块", model="bonsai", scope="src/auth/", rework=1)',
 			"",
-			"【并行】本地任务串行排队（显卡一次只能跑一个）；但可以用 model=cloud_* 派云端任务，它与本地真并行。",
+			"【并行】占显存的本地任务串行排队；不占显存的模型（云端/网关）可与本地真并行。",
 			"",
 			"【不想干等 → 异步模式】async=true：毫秒级返回 taskId，**你立刻能继续干自己的活**——",
 			"执行/验收/返工/升档整套在后台照常跑，跑完后用 pi_result(taskId) 取完整结果。",
@@ -230,14 +235,10 @@ const TOOLS = [
 				model: {
 					type: "string",
 					description: [
-						"不填 = 自动按任务类型路由到本地主力（27B）。",
+						"不填 = 自动按任务类型路由到默认模型。",
 						"",
 						"本地（占显存，串行排队）：" + LOCAL_ALIASES.join(" / "),
-						"　· bonsai = 27B 主力，最聪明也最慢（改一个文件约 80–190 秒）",
-						"　· cloud_* 类名之外的本地别名还有更快的，但能力弱于 bonsai",
-						"",
-						"云端（不占显存，可与本地真并行，几秒返回）：" + CLOUD_ALIASES.join(" / "),
-						"　· 只在『要快出结果』或『本地引擎没启动』时用",
+						"云端/网关（不占本地显存，可与本地真并行）：" + CLOUD_ALIASES.join(" / "),
 						"",
 						"任务类型关键词（也可直接填，自动路由）：" + Object.keys(TASK_ROUTING).join(" / "),
 					].join("\n"),
@@ -391,7 +392,7 @@ function statusTable() {
 	return {
 		active,
 		maxConcurrent: MAX_CONCURRENT,
-		note: "本机 8GB VRAM，同时只跑一个本地模型；多任务自动排队。异步任务见 asyncTasks 一节（派发即返回，完成后用 pi_result 取结果）。",
+		note: "占本地显存的模型（local-*）串行排队；不占显存的模型不限并发。异步任务见 asyncTasks 一节（派发即返回，完成后用 pi_result 取结果）。",
 		total: rows.length + queued.length,
 		running: rows.filter((r) => r.status === "running").length,
 		queued: queued.length,
@@ -505,7 +506,7 @@ async function executeCore(args, ctl = {}) {
 		verifyCmd,
 	});
 
-	const timeoutMs = args.timeoutMs || 600000;
+	const timeoutMs = args.timeoutMs || DEFAULT_TIMEOUT_MS;
 	// 拍「前」快照：用来证明到底改了什么，而不是相信模型自述
 	const before = verifyCmd || scope ? snapshot(workdir) : null;
 
@@ -549,7 +550,7 @@ async function executeCore(args, ctl = {}) {
 		return text(
 			`❌ 任务失败（${taskId}）：${attempt.error}` +
 				(attempt.stderr ? `\n\nstderr:\n${attempt.stderr}` : "") +
-				(attempt.error === "cancelled" ? "" : "\n\n提示：确认对应模型引擎已启动，且显存足够（本机 8GB 同时只宜跑一个）。"),
+				(attempt.error === "cancelled" ? "" : "\n\n提示：确认对应模型端点已就绪（本地模型需先启动推理引擎），且显存/内存足够。"),
 		);
 	}
 
