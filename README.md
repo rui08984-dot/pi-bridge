@@ -6,7 +6,7 @@
 
 ```
 你的 MCP 客户端（编排者）
-   │  MCP：pi_execute / pi_status / pi_cancel
+   │  MCP：pi_execute（可异步）/ pi_result / pi_status / pi_cancel
    ▼
 pi-bridge（本包，MCP stdio server）
    │  spawn `pi --mode rpc`（常驻子进程）
@@ -106,13 +106,36 @@ npm run selftest  # 配置解析 + 端点探活 + Pi RPC 握手（只读）
 
 ---
 
-## 三个工具
+## 四个工具
 
 | 工具 | 作用 |
 |---|---|
-| `pi_execute` | 派子任务，回传结构化结果（状态 / 耗时 / 工具轨迹 / token / 证据链） |
-| `pi_status` | 任务状态表：taskId、模型、状态、耗时、当前工具、工具调用数、排队情况 |
-| `pi_cancel` | 取消任务；排队中的直接出队（不占资源） |
+| `pi_execute` | 派子任务，回传结构化结果（状态 / 耗时 / 工具轨迹 / token / 证据链）。加 `async: true` 则秒回 taskId，不阻塞 |
+| `pi_result` | 取回**异步任务**的最终结果（跑着给进度，可选就地等；结果存内存+磁盘，跨会话也能取） |
+| `pi_status` | 任务状态表：`tasks` = 在跑的，`asyncTasks` = 异步派发的 |
+| `pi_cancel` | 取消任务（同步/异步/排队中都支持，立即生效） |
+
+### 异步模式：派完就走，不必干等 ⭐
+
+MCP 工具调用是「请求-响应」，同步等结果的调用方在整条验收链跑完前只能干等——
+一个云端任务动辄 1–10 分钟。**加 `async: true` 就变成派发即返回**：
+
+```
+pi_execute(task="重构认证模块", verify="npm test", async=true)
+  → 🚀 任务已派发（异步）｜taskId: t-xxx   ← 200ms 内返回，你立刻能继续干活
+
+（……你干自己的活，Pi 在后台跑执行→验收→返工→升档……）
+
+pi_result(taskId="t-xxx")                    ← 完成后取完整结果
+pi_result(taskId="t-xxx", waitMs=120000)     ← 或就地等最多 2 分钟
+pi_cancel(taskId="t-xxx")                    ← 随时可停
+```
+
+**关键保证**：异步任务跑的是**同一条验收链代码**——验收/返工/升档/证据链一字不差，
+不存在"异步模式打了折"。结果写内存 + `~/.pi-bridge/tasks/` 落盘（滚动保留最近 200 个），
+进程重启或换会话也能取回。
+
+> 实测：派发返回 **207ms**（同步模式要 30–600 秒）；派完后自己的活 3 秒干完时 Pi 还在跑。
 
 ### `pi_execute` 参数
 
@@ -128,6 +151,7 @@ npm run selftest  # 配置解析 + 端点探活 + Pi RPC 握手（只读）
 | `escalate` | 返工是否升档到更强模型（默认 `true`） |
 | `scope` | 限定可改路径前缀；越界即判失败 |
 | `mode` | `implement`（默认）/ `explore`（只读，进程级禁写） |
+| `async` | `true` = 异步派发（秒回 taskId）；默认 `false` = 同步等结果 |
 | `timeoutMs` | 单任务超时（默认 600000） |
 | `includeContext` | 是否注入项目简报（需配置 sessionrelay，否则自动跳过） |
 
@@ -139,6 +163,7 @@ node src/server.js exec "创建 ok.txt" --model=local-main --dir=/tmp/w \
   --verify="if exist ok.txt (exit 0) else (exit 1)"
 node src/server.js exec "分析架构" --model=local-main --mode=explore     # 只读
 node src/server.js exec "改 src/"  --model=local-main --scope=src/ --rework=1
+node src/server.js exec "长任务"   --model=local-main --async=true --wait=300000   # 异步派发
 ```
 
 ---

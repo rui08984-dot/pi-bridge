@@ -1,7 +1,7 @@
 /**
  * PiNode —— 单个 Pi RPC 进程的生命周期封装。
  *
- * 协议要点（对照 Pi 官方 docs/rpc.md 实测校正，勿凭记忆改）：
+ * 协议要点（对照 D:/llm/pi/docs/rpc.md 实测校正，勿凭记忆改）：
  *   - 字段名是 `message`，**不是** `content`
  *   - 命令带 `id` 才回带 `id` 的 `{"type":"response"}`；事件流无 id
  *   - agent_settled 才是「彻底干完」（agent_end 后可能还有重试/压缩/队列续跑）
@@ -11,7 +11,8 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { PI_EXE } from "./config.js";
+
+const PI_EXE = process.env.PI_EXE || "D:\\llm\\pi\\pi.exe";
 
 export class PiNode extends EventEmitter {
 	constructor({ taskId, cwd, provider, model = "local-model", thinking = null, excludeTools = null, allowTools = null }) {
@@ -68,15 +69,15 @@ export class PiNode extends EventEmitter {
 			this.emit("node-error", { taskId: this.taskId, error: String(err) });
 		});
 		this.proc.on("exit", (code) => {
-			// 退出码 134 / -4058 一类 = 运行时申请显存失败（本地大模型加载后余量极小）。
-			// 实测踩过：引擎把显存吃满后，pi 进程连启动都起不来，stderr 却是空的——
-			// 光看「引擎在线」会被误导，必须专门提示。
+			// Bun 运行时的 OOM 退出码（Windows 上表现为 -4058 / 0xFFFFF018 一类）。
+			// 实测踩过：引擎把显存吃满后，pi.exe 连启动都起不来，stderr 却是空的——
+			// 光看「引擎在线」会被误导，必须专门提示显存。
 			if (code !== 0 && code !== null) {
 				this.exitHint =
 					code === -4058 || code === 134
-						? `pi 进程启动即退出（exit=${code}），这是运行时申请显存失败。` +
-						  `本地引擎加载后显存余量不足时就会这样。` +
-						  `处理：关掉其它占显存的程序，或换更小的模型/量化档。`
+						? `pi 进程启动即退出（exit=${code}），这是 Bun 运行时申请显存失败。` +
+						  `引擎已占满显存时就会这样——8GB 卡上本地引擎加载后余量极小。` +
+						  `处理：关掉占显存的程序（浏览器/QQ/Docker），或重启引擎。`
 						: null;
 			}
 			// 非正常收尾（被 cancel/崩溃）时唤醒等待者，避免永久挂起
@@ -198,7 +199,9 @@ export class PiNode extends EventEmitter {
 		try {
 			await this._send({ type: "prompt", payload: { message: prompt } }, { timeoutMs: 30000 });
 		} catch (err) {
-			this.status = "failed";
+			// 取消路径下 _send 被 kill 打断是预期行为——不要用 "failed" 覆盖 "cancelled"，
+			// 否则调用方分不清"被取消了"和"真失败了"（实测踩过）。
+			if (this.status !== "cancelled") this.status = "failed";
 			throw err;
 		}
 		await this._waitSettled(timeoutMs);
@@ -265,12 +268,16 @@ export class PiNode extends EventEmitter {
 		// token 优先用 assistant消息自带的 usage（--no-session 下 stats 常为空）
 		let tokens = lastUsage;
 		let contextUsage = null;
-		try {
-			const stats = await this.sessionStats();
-			if (stats?.tokens && (!tokens || !tokens.total)) tokens = stats.tokens;
-			contextUsage = stats?.contextUsage || null;
-		} catch {
-			/* 进程可能已退出，统计拿不到不算失败 */
+		// 取消/中止路径跳过 stats：进程已被 kill，_send 要么 EPIPE 要么等满 15s 超时，
+		// 而取消的任务不需要精确 token 统计（实测：不跳过会让取消卡 15 秒才收尾）。
+		if (this.status !== "cancelled" && !this._abandoned) {
+			try {
+				const stats = await this.sessionStats();
+				if (stats?.tokens && (!tokens || !tokens.total)) tokens = stats.tokens;
+				contextUsage = stats?.contextUsage || null;
+			} catch {
+				/* 进程可能已退出，统计拿不到不算失败 */
+			}
 		}
 
 		// ⚠️ 静默失败探测：模型把工具调用吐成了纯文本（Qwen 原生模板没被解析成结构化调用）。
@@ -324,6 +331,27 @@ export class PiNode extends EventEmitter {
 		} catch {
 			/* ignore */
 		}
+		// 进程已死 → 所有在途命令（pending 的 _send）永远等不到响应：
+		// 立即全部 reject，否则调用方要白等满各自的超时（实测踩过：
+		// 取消一个正在跑的任务，卡在 _send(prompt) 的 30s 超时上才收尾）。
+		const ps = [...this.pending.values()];
+		this.pending.clear();
+		for (const p of ps) {
+			try {
+				p.reject(new Error("pi 进程已被中止（kill）"));
+			} catch {
+				/* ignore */
+			}
+		}
+		this.endedAt = this.endedAt || Date.now();
+		this._wakeSettled();
+	}
+
+	/** 立即放弃等待（不等进程退出）：状态已定，唤醒所有等待者，并标记跳过 stats 查询。取消路径用。 */
+	abandon() {
+		this._abandoned = true;
+		this.endedAt = this.endedAt || Date.now();
+		this._wakeSettled();
 	}
 }
 

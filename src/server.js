@@ -1,16 +1,14 @@
 #!/usr/bin/env node
 /**
- * pi-bridge —— 把 Pi 执行节点暴露为 MCP 工具，让任意 MCP 客户端（ZCode / Claude Code / Codex …）能派活、查状态、取消。
+ * pi-bridge —— 把本地 Pi 执行节点暴露为 MCP 工具，让 ZCode 能派活/查状态/取消。
  *
  * 暴露三个工具（刻意保持精简）：
- *   pi_execute  派一个子任务给指定模型，跑完回传结构化结果
+ *   pi_execute  派一个子任务给本地模型，跑完回传结构化结果
  *   pi_status   列出所有在跑/已完成的任务状态表
  *   pi_cancel   取消指定任务
  *
  * 同时支持单次 CLI 模式便于命令行验收：
- *   node src/server.js exec "任务" --model=coding --dir=/path/to/repo
- *
- * 配置：全部路径与模型表都可外置（见 README「配置」），代码不含个人环境硬编码。
+ *   node src/server.js exec "任务" --model=coding --dir=D:\repo
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -30,23 +28,123 @@ import {
 	MODEL_ALIASES,
 } from "./models.js";
 import { runVerify, snapshot, diffSnapshots, checkScope, buildReworkPrompt, buildEvidence } from "./verify.js";
-import { MAX_CONCURRENT as CFG_MAX_CONCURRENT, DEFAULT_TIMEOUT_MS } from "./config.js";
+
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /** 在跑任务表：taskId -> PiNode */
 const nodes = new Map();
 const MAX_NODES = 64;
 
 /**
+ * 异步任务表（2026-10-06）：taskId -> state
+ *
+ * 为什么需要：MCP 工具调用是「请求-响应」——同步模式下调用方发出 pi_execute 后
+ * 整条验收链（执行/返工/升档）跑完才返回，期间调用方只能干等。
+ * 异步模式让 pi_execute(async=true) **毫秒级**返回 taskId，调用方立刻能干别的活；
+ * 验收链全部在后台照常跑，之后用 pi_result(taskId) 取完整结果。
+ *
+ * 结果同时落盘（~/.pi-bridge/tasks/），进程重启/换会话也能取回。
+ * 同步模式（默认）不写这里，行为零变化。
+ */
+const asyncTasks = new Map();
+const MAX_ASYNC_TASKS = 64;
+const TASKS_DIR = join(homedir(), ".pi-bridge", "tasks");
+
+/** 把异步任务记录落盘（结果单独存 .result.txt，读取时拼回）。落盘失败不影响主流程。 */
+function persistTask(state) {
+	try {
+		mkdirSync(TASKS_DIR, { recursive: true });
+		const rec = {
+			taskId: state.taskId,
+			task: String(state.task || "").slice(0, 300),
+			status: state.status,
+			phase: state.phase || "",
+			modelHint: state.modelHint || "",
+			startedAt: state.startedAt,
+			finishedAt: state.finishedAt || null,
+			pid: process.pid,
+		};
+		writeFileSync(join(TASKS_DIR, `${state.taskId}.json`), JSON.stringify(rec, null, 1), "utf8");
+		if (state.resultText) writeFileSync(join(TASKS_DIR, `${state.taskId}.result.txt`), state.resultText, "utf8");
+	} catch {
+		/* 落盘失败不影响任务本身 */
+	}
+}
+
+/** 从磁盘读回任务记录（进程重启/跨会话取结果的兜底）。taskId 校验防路径穿越。 */
+function loadTaskFromDisk(taskId) {
+	if (!/^t-[A-Za-z0-9_-]{1,64}$/.test(taskId)) return null;
+	try {
+		const rec = JSON.parse(readFileSync(join(TASKS_DIR, `${taskId}.json`), "utf8"));
+		let resultText = null;
+		try {
+			resultText = readFileSync(join(TASKS_DIR, `${taskId}.result.txt`), "utf8");
+		} catch {
+			/* 结果文件可能还没写出 */
+		}
+		return { ...rec, resultText };
+	} catch {
+		return null;
+	}
+}
+
+/** 控制磁盘记录数量（默认留最近 200 个）。 */
+function pruneTaskFiles(maxFiles = 200) {
+	try {
+		const files = readdirSync(TASKS_DIR)
+			.filter((f) => f.endsWith(".json"))
+			.map((f) => {
+				try {
+					return { f, t: statSync(join(TASKS_DIR, f)).mtimeMs };
+				} catch {
+					return null;
+				}
+			})
+			.filter(Boolean)
+			.sort((a, b) => a.t - b.t);
+		const excess = files.length - maxFiles;
+		for (let i = 0; i < excess; i++) {
+			try {
+				unlinkSync(join(TASKS_DIR, files[i].f));
+			} catch {}
+			try {
+				unlinkSync(join(TASKS_DIR, files[i].f.replace(/\.json$/, ".result.txt")));
+			} catch {}
+		}
+	} catch {
+		/* 目录不存在等，忽略 */
+	}
+}
+
+/** 内存表淘汰：优先清已完结的最旧任务。 */
+function evictAsyncTasks() {
+	if (asyncTasks.size <= MAX_ASYNC_TASKS) return;
+	const done = [...asyncTasks.values()].filter((s) => s.status !== "running").sort((a, b) => (a.finishedAt || 0) - (b.finishedAt || 0));
+	for (const s of done) {
+		if (asyncTasks.size <= MAX_ASYNC_TASKS) break;
+		asyncTasks.delete(s.taskId);
+	}
+}
+
+/** 取消专用错误：被拦截而非普通失败。 */
+function cancelledError(taskId) {
+	const e = new Error(`任务 ${taskId} 已被取消`);
+	e.cancelled = true;
+	return e;
+}
+
+/**
  * 并发闸门：**只管本地模型**。
  *
- * 本地引擎一次只能跑一个（典型是单张显卡跑量化模型）→ 本地任务串行排队。
- * 云端/网关模型不占本地显存，**应当与本地模型真正并行**——
- * 所以闸门按 provider 分流：local-* 进闸门，其它直接放行。
+ * 本机 8GB VRAM，本地引擎一次只能跑一个 → 本地任务串行排队。
+ * 但云端链（newapi）不占显存，**应当与本地模型真正并行**——
+ * 所以闸门按 provider分流：local-* 进闸门，newapi 直接放行。
  *
  * 于是「一个本地 + 一个云端」是真并行的，不是排队。
- * 上游用大显存机器时可调大：config 的 maxConcurrent 或环境变量 PI_BRIDGE_CONCURRENCY。
  */
-const MAX_CONCURRENT = CFG_MAX_CONCURRENT;
+const MAX_CONCURRENT = Number(process.env.PI_BRIDGE_CONCURRENCY || 1);
 let active = 0;
 const waiting = []; // {taskId, modelLabel, resolve, reject, cancelled}
 
@@ -99,26 +197,28 @@ const TOOLS = [
 	{
 		name: "pi_execute",
 		description: [
-			"【何时用】把子任务派给另一个模型跑（本地自建模型，或你配置的云端/网关模型）。",
-			"适合：大批量文本处理、代码审查、跑测试/构建、日志分析、批量改代码——这些活派出去能给主会话省 token。",
+			"【何时用】把子任务派给本地模型跑。本机 8GB 显卡上跑的是你自建的 NInfer/AtomicBot 量化模型（非 Ollama），不花 API 费、数据不出本机。",
+			"适合：大批量文本处理、代码审查、跑测试/构建、日志分析、本地批量改代码。",
 			"不适合：简单问答、几秒钟就能自己做完的小事——那种直接做更快。",
 			"",
-			"【重要·前置条件】被派活的模型端点必须已就绪：",
-			"  · 本地模型 = 你需要先手动启动它的推理引擎（本工具不会替你拉进程）；",
-			"  · 云端模型 = 网关/API 可达即可（通常无需额外启动）。",
-			"若返回 unreachable，说明端点没起来——先启动它，不要反复重试。",
+			"【重要·前置条件】本地模型引擎必须已经由用户手动启动（桌面快捷方式『启动本地AI-菜单』→ 选 9 或 10）。",
+			"本工具**不会**替你启动引擎。若返回 unreachable，说明引擎没开——请让用户先启动，不要重试。",
 			"",
-			"【强烈建议】带 verify 参数。弱模型会说『我做完了』但工具可能没真执行；",
+			"【强烈建议】带 verify 参数。本地量化模型会说『我做完了』但工具可能没真执行；",
 			"只有你给的验收命令跑出退出码 0 才算真完成。这是唯一可信的完成信号。",
 			"",
 			"【示例】",
 			'pi_execute(task="给 src/utils.ts 补空值检查", verify="npm test")',
 			'pi_execute(task="分析 logs/ 里的报错", mode="explore")   // 只读，不会改任何文件',
-			'pi_execute(task="重构认证模块", model=bonsai, scope="src/auth/", rework=1)',
+			'pi_execute(task="重构认证模块", model="bonsai", scope="src/auth/", rework=1)',
 			"",
-			"【并行】占显存的本地任务串行排队；不占显存的模型（云端/网关）可与本地真并行。",
-			"【经济性】推荐「弱模型打头阵 + 验收兜底 + 升档重试」：便宜模型有大概率一次做对，",
-			"做不对时 rework 会自动升档到更强的模型（详见 escalate 参数）。",
+			"【并行】本地任务串行排队（显卡一次只能跑一个）；但可以用 model=cloud_* 派云端任务，它与本地真并行。",
+			"",
+			"【不想干等 → 异步模式】async=true：毫秒级返回 taskId，**你立刻能继续干自己的活**——",
+			"执行/验收/返工/升档整套在后台照常跑，跑完后用 pi_result(taskId) 取完整结果。",
+			'   例：pi_execute(task="…", verify="npm test", async=true)',
+			'   之后：pi_result(taskId="t-xxx")  或  pi_result(taskId="t-xxx", waitMs=120000)（就地等 2 分钟）',
+			"想边派活边干别的、或一次派多个任务 → 用 async=true；必须拿到结果才能往下走 → 用默认同步模式。",
 		].join("\n"),
 		inputSchema: {
 			type: "object",
@@ -130,10 +230,14 @@ const TOOLS = [
 				model: {
 					type: "string",
 					description: [
-						"不填 = 自动按任务类型路由到默认模型。",
+						"不填 = 自动按任务类型路由到本地主力（27B）。",
 						"",
 						"本地（占显存，串行排队）：" + LOCAL_ALIASES.join(" / "),
-						"云端/网关（不占本地显存，可与本地真并行）：" + CLOUD_ALIASES.join(" / "),
+						"　· bonsai = 27B 主力，最聪明也最慢（改一个文件约 80–190 秒）",
+						"　· cloud_* 类名之外的本地别名还有更快的，但能力弱于 bonsai",
+						"",
+						"云端（不占显存，可与本地真并行，几秒返回）：" + CLOUD_ALIASES.join(" / "),
+						"　· 只在『要快出结果』或『本地引擎没启动』时用",
 						"",
 						"任务类型关键词（也可直接填，自动路由）：" + Object.keys(TASK_ROUTING).join(" / "),
 					].join("\n"),
@@ -199,6 +303,13 @@ const TOOLS = [
 						"explore=只读：write/edit 在**进程层面**被禁用，模型物理上写不了任何文件。" +
 						"只要分析/调研/理解代码就用 explore，绝不会误改文件。",
 				},
+				async: {
+					type: "boolean",
+					description:
+						"true = 异步派发：毫秒级返回 taskId，不阻塞你，执行/验收/返工/升档全部在后台照常跑；" +
+						"之后用 pi_result(taskId) 取完整结果。适合『派完就继续干自己的活』或一次派多个任务。" +
+						"默认 false（同步等结果，与旧行为一致）。",
+				},
 			},
 			required: ["task"],
 		},
@@ -207,11 +318,34 @@ const TOOLS = [
 		name: "pi_status",
 		description: [
 			"查看所有 pi_execute 任务的实时状态表：taskId、模型、状态、耗时、当前正在调用的工具、工具调用数。",
-			"含排队情况——本地模型串行排队，queue 字段显示还有几个在等。",
-			"云端任务也会出现在 tasks 里（它们不占显卡，可与本地同时跑）。",
+			"含两节：tasks = 正在跑的（含排队的）；asyncTasks = 异步派发的（派发即返回的那些，完成后用 pi_result 取结果）。",
 			"想在等待时向用户汇报进度、或想确认某个 taskId 是否还在跑时调用。",
 		].join("\n"),
 		inputSchema: { type: "object", properties: {} },
+	},
+	{
+		name: "pi_result",
+		description: [
+			"取回**异步任务**（pi_execute 带 async=true 派发的）的最终结果。",
+			"任务还在跑 → 返回进度（当前阶段/当前工具），可加 waitMs 就地等一会；",
+			"任务已完成 → 返回完整结果（含验收结论、证据链、返工/升档轨迹——与同步模式一字不差）。",
+			"结果存在内存 + 磁盘，**跨会话/进程重启也能取回**。",
+			"",
+			'例：pi_result(taskId="t-abc123")  或  pi_result(taskId="t-abc123", waitMs=120000)',
+			"注意：同步派发的任务结果在 pi_execute 返回时就已经给你了，不需要用本工具。",
+		].join("\n"),
+		inputSchema: {
+			type: "object",
+			properties: {
+				taskId: { type: "string", description: "异步任务的 taskId（来自 pi_execute(async=true) 的返回，或 pi_status 的 asyncTasks 一节）。" },
+				waitMs: {
+					type: "number",
+					description: "可选：任务还在跑时就地等待的毫秒数（1–600000，默认 0=不等，立刻返回进度）。",
+				},
+				purge: { type: "boolean", description: "可选：取完后从内存表移除（磁盘记录仍按最近 200 个滚动保留）。默认 false。" },
+			},
+			required: ["taskId"],
+		},
 	},
 	{
 		name: "pi_cancel",
@@ -246,20 +380,29 @@ function statusTable() {
 	const queued = waiting
 		.filter((w) => !w.cancelled)
 		.map((w, i) => ({ position: i + 1, taskId: w.taskId, model: w.modelLabel, status: "queued" }));
+	// 异步任务视图（2026-10-06）：与节点表并列——它才是"派完就走"的入口
+	const asyncRows = [...asyncTasks.values()].map((st) => ({
+		taskId: st.taskId,
+		model: st.modelHint || "-",
+		status: st.status === "running" ? `running·${st.phase || ""}` : st.status,
+		elapsedSec: Math.round(((st.finishedAt || Date.now()) - st.startedAt) / 1000),
+		resultReady: !!st.resultText,
+	}));
 	return {
 		active,
 		maxConcurrent: MAX_CONCURRENT,
-		note: "占本地显存的模型（local-*）串行排队；不占显存的模型不限并发",
+		note: "本机 8GB VRAM，同时只跑一个本地模型；多任务自动排队。异步任务见 asyncTasks 一节（派发即返回，完成后用 pi_result 取结果）。",
 		total: rows.length + queued.length,
 		running: rows.filter((r) => r.status === "running").length,
 		queued: queued.length,
 		tasks: rows,
 		queue: queued,
+		asyncTasks: asyncRows,
 	};
 }
 
 /** 在指定模型上跑一次（不含回退逻辑）。返回 {res, node}。 */
-async function runOnce({ taskId, prompt, workdir, m, timeoutMs, excludeTools, allowTools }) {
+async function runOnce({ taskId, prompt, workdir, m, timeoutMs, excludeTools, allowTools, onNode }) {
 	const node = new PiNode({
 		taskId,
 		cwd: workdir,
@@ -269,6 +412,14 @@ async function runOnce({ taskId, prompt, workdir, m, timeoutMs, excludeTools, al
 		allowTools,
 	});
 	nodes.set(taskId, node);
+	// 异步模式的钩子：把当前节点暴露给调用方（取消时要能中止它）
+	if (typeof onNode === "function") {
+		try {
+			onNode(node);
+		} catch {
+			/* 钩子异常不影响任务 */
+		}
+	}
 	if (nodes.size > MAX_NODES) {
 		const oldest = [...nodes.entries()].find(([, n]) => n.status !== "running");
 		if (oldest) {
@@ -314,8 +465,11 @@ function needsFallback(res) {
 	return false;
 }
 
-async function execute(args) {
-	const taskId = `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+async function executeCore(args, ctl = {}) {
+	const taskId = ctl.taskId || `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+	// 异步模式的三个钩子：取消探测 / 阶段上报 / 节点追踪。同步模式全部为空操作。
+	const checkCancel = ctl.isCancelled || (() => false);
+	const setPhase = ctl.onPhase || (() => {});
 	const workdir = args.workdir || process.cwd();
 
 	// 模型选择：显式别名 > 任务类型路由 > 默认（主力 Bonsai）
@@ -351,11 +505,14 @@ async function execute(args) {
 		verifyCmd,
 	});
 
-	const timeoutMs = args.timeoutMs || DEFAULT_TIMEOUT_MS;
+	const timeoutMs = args.timeoutMs || 600000;
 	// 拍「前」快照：用来证明到底改了什么，而不是相信模型自述
 	const before = verifyCmd || scope ? snapshot(workdir) : null;
 
-	let attempt = await runOnce({ taskId, prompt, workdir, m, timeoutMs, excludeTools });
+	// 取消检查点 ①：开工前
+	if (checkCancel()) throw cancelledError(taskId);
+	setPhase("执行中（模型干活）");
+	let attempt = await runOnce({ taskId, prompt, workdir, m, timeoutMs, excludeTools, onNode: ctl.onNode });
 
 	// —— 自动回退 ——
 	// 触发条件：① 主模型工具调用退化 ② 主模型引擎没起（你一次只跑一个引擎，
@@ -365,6 +522,7 @@ async function execute(args) {
 	if (wantFallback) {
 		const chain = FALLBACK_CHAIN[primaryAlias] || [];
 		for (const alt of chain) {
+			if (checkCancel()) throw cancelledError(taskId);
 			const altM = resolveModel(alt);
 			if (!altM || altM.provider === m.provider) continue;
 			// 引擎没起的情况：只有备选真的在线才值得重试
@@ -375,7 +533,8 @@ async function execute(args) {
 					? `主力模型 ${primaryAlias} 的引擎未启动`
 					: `主力模型 ${primaryAlias} 本轮工具调用退化（输出了 <​tool_call> 文本但未真正执行）`;
 			fallbackNote = `\n\n♻️ ${why}，已自动改用 ${alt} 重跑。`;
-			attempt = await runOnce({ taskId: taskId + "-fb", prompt, workdir, m: altM, timeoutMs, excludeTools });
+			setPhase(`回退重跑（${alt}）`);
+			attempt = await runOnce({ taskId: taskId + "-fb", prompt, workdir, m: altM, timeoutMs, excludeTools, onNode: ctl.onNode });
 			if (!attempt.error && attempt.res?.status === "completed" && !attempt.res.toolCallDegraded) {
 				m = altM;
 				break;
@@ -384,11 +543,13 @@ async function execute(args) {
 		}
 	}
 
+	if (checkCancel()) throw cancelledError(taskId);
+
 	if (attempt.error) {
 		return text(
 			`❌ 任务失败（${taskId}）：${attempt.error}` +
 				(attempt.stderr ? `\n\nstderr:\n${attempt.stderr}` : "") +
-				(attempt.error === "cancelled" ? "" : "\n\n提示：确认对应模型端点已就绪（本地模型需先启动推理引擎），且显存/内存足够。"),
+				(attempt.error === "cancelled" ? "" : "\n\n提示：确认对应模型引擎已启动，且显存足够（本机 8GB 同时只宜跑一个）。"),
 		);
 	}
 
@@ -403,6 +564,8 @@ async function execute(args) {
 
 	for (let round = 1; round <= maxRework + 1; round++) {
 		if (!before) break; // 没配验收/范围，直接收工
+		if (checkCancel()) throw cancelledError(taskId);
+		setPhase(round === 1 ? "验收中" : `验收第 ${round} 轮`);
 
 		const after = snapshot(workdir);
 		verifyResult = verifyCmd ? await runVerify(verifyCmd, workdir) : null;
@@ -438,6 +601,8 @@ async function execute(args) {
 			round: round + 1,
 			maxRounds: maxRework + 1,
 		});
+		if (checkCancel()) throw cancelledError(taskId);
+		setPhase(`返工第 ${round + 1} 轮（模型 ${aliasOf(m)}）`);
 		const re = await runOnce({
 			taskId: `${taskId}-rw${round}`,
 			prompt: reworkPrompt,
@@ -445,6 +610,7 @@ async function execute(args) {
 			m,
 			timeoutMs,
 			excludeTools,
+			onNode: ctl.onNode,
 		});
 		if (re.error) break;
 		attempt = re;
@@ -538,6 +704,128 @@ async function execute(args) {
 	);
 }
 
+/**
+ * 异步派发（2026-10-06）：毫秒级返回 taskId，验收/返工/升档在后台照常跑。
+ *
+ * 设计要点：
+ *   · 后台任务跑的还是 executeCore —— 验收链与同步模式**完全同一条代码**，
+ *     不存在"异步模式验收打了折"的问题；
+ *   · 结果写内存表 + 落盘，pi_result 随时可取（进程重启也能捞回）；
+ *   · 取消走 pi_cancel：置标记 + 中止当前节点，executeCore 在检查点抛 cancelled。
+ */
+function dispatchAsync(args) {
+	const taskId = `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+	const state = {
+		taskId,
+		task: args.task || "",
+		status: "running",
+		phase: "已派发，准备启动",
+		modelHint: args.model || "(按任务类型路由)",
+		startedAt: Date.now(),
+		finishedAt: null,
+		resultText: null,
+		currentNodeId: null,
+		cancelled: false,
+	};
+	asyncTasks.set(taskId, state);
+	evictAsyncTasks();
+	pruneTaskFiles();
+	persistTask(state);
+
+	// fire-and-forget：不 await。用 .catch 兜住所有异常，绝不让它变成 unhandled rejection。
+	executeCore(args, {
+		taskId,
+		onPhase: (p) => {
+			state.phase = p;
+			persistTask(state);
+		},
+		onNode: (node) => {
+			state.currentNodeId = node.taskId;
+			state.modelHint = `${node.provider}/${node.model}`;
+			persistTask(state);
+		},
+		isCancelled: () => state.cancelled,
+	})
+		.then((out) => {
+			const txt = out?.content?.[0]?.text ?? "(无结果文本)";
+			state.resultText = txt;
+			// 结果头本身带结论（✅/❌），据此定终态；被取消则优先按取消算
+			state.status = state.cancelled ? "cancelled" : txt.startsWith("❌") ? "failed" : "completed";
+		})
+		.catch((err) => {
+			state.status = err?.cancelled ? "cancelled" : "failed";
+			state.resultText = err?.cancelled
+				? `🛑 任务 ${taskId} 已被取消（验收链未跑完）。`
+				: `❌ 后台任务异常：${String(err).slice(0, 500)}`;
+		})
+		.finally(() => {
+			state.finishedAt = Date.now();
+			persistTask(state);
+		});
+
+	return text(
+		`🚀 任务已派发（异步）｜taskId: ${taskId}\n` +
+			`   模型：${state.modelHint}` +
+			(args.verify ? `\n   验收：\`${String(args.verify).slice(0, 120)}\`（含返工/升档，后台自动跑）` : "") +
+			`\n\n**你现在就可以继续干别的活**，不必等它。之后：\n` +
+			`   · 取结果：pi_result(taskId="${taskId}")（没完成会给进度；结果会存住，跨会话也能取）\n` +
+			`   · 看全部：pi_status（asyncTasks 一节）\n` +
+			`   · 要停：pi_cancel(taskId="${taskId}")`,
+	);
+}
+
+/** pi_result 的实现：内存优先、磁盘兜底；跑着可等可选。 */
+async function piResult(args) {
+	const taskId = String(args.taskId || "").trim();
+	if (!taskId) return text("需要 taskId——异步任务的 taskId 来自 pi_execute(async=true) 的返回，或 pi_status 的 asyncTasks 一节。");
+
+	let st = asyncTasks.get(taskId);
+	let fromDisk = false;
+	if (!st) {
+		st = loadTaskFromDisk(taskId);
+		fromDisk = true;
+		if (!st) {
+			return text(
+				`未找到任务 ${taskId}。\n` +
+					`· 异步任务的 taskId 来自 pi_execute(async=true) 的返回；\n` +
+					`· 同步任务（默认）的结果在派发调用时就返回了，不在这里；\n` +
+					`· 磁盘记录只保留最近 200 个。`,
+			);
+		}
+	}
+
+	// 可选就地等待（只在同一进程持有任务时有意义；上限 10 分钟）
+	const waitMs = Math.min(Number(args.waitMs) || 0, 600000);
+	if (st.status === "running" && waitMs > 0 && !fromDisk) {
+		const deadline = Date.now() + waitMs;
+		while (st.status === "running" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 1000));
+		}
+	}
+
+	if (st.status === "running") {
+		const secs = Math.round(((st.finishedAt || Date.now()) - st.startedAt) / 1000);
+		const node = st.currentNodeId ? nodes.get(st.currentNodeId) : null;
+		const where = fromDisk ? `（磁盘记录，由 PID ${st.pid} 持有——若该进程已退出则任务可能已中断）` : "";
+		return text(
+			`⏳ 任务 ${taskId} 仍在运行（已 ${secs}s）｜阶段：${st.phase || "-"}` +
+				(node?.currentTool ? `｜当前工具：${node.currentTool}` : "") +
+				where +
+				`\n完成后再次调用 pi_result(taskId="${taskId}")，或加 waitMs=毫秒数 就地等一会（上限 600000）。`,
+		);
+	}
+
+	const body = st.resultText || "(无结果文本)";
+	if (args.purge === true && !fromDisk) asyncTasks.delete(taskId);
+	return text(`【异步任务 ${taskId}｜${st.status}｜${st.modelHint || "-"}】\n\n${body}`);
+}
+
+/** MCP 统一入口：async=true 走异步派发，其余与旧行为完全一致。 */
+async function execute(args) {
+	if (args?.async === true) return dispatchAsync(args);
+	return executeCore(args);
+}
+
 // —— MCP 模式 ——
 async function main() {
 	const server = new Server(
@@ -552,8 +840,29 @@ async function main() {
 		try {
 			if (name === "pi_execute") return await execute(args || {});
 			if (name === "pi_status") return text(statusTable());
+			if (name === "pi_result") return await piResult(args || {});
 			if (name === "pi_cancel") {
-				// 排队中的任务：出队即可，不必等它拿到槽位
+				// ② 异步任务：置取消标记（executeCore 在检查点抛 cancelled）+ 立即中止当前节点
+				const ast = asyncTasks.get(args.taskId);
+				if (ast) {
+					if (ast.status !== "running") {
+						return text(`任务 ${args.taskId} 已结束（${ast.status}），无需取消。可用 pi_result 取结果。`);
+					}
+					ast.cancelled = true;
+					ast.phase = "取消中…";
+					persistTask(ast);
+					const an = ast.currentNodeId ? nodes.get(ast.currentNodeId) : null;
+					if (an) {
+						an.status = "cancelled";
+						// 先 kill（立即断开，让 run() 的 settle 等待者被唤醒），
+						// abort 命令只是尽力礼貌通知——绝不能 await 它：那条命令自带 10s 超时，
+						// 串行等待会让"取消"这个动作本身卡 10 秒（实测踩过）。
+						an.kill();
+						an.cancel().catch(() => {});
+					}
+					return text(`已取消异步任务 ${args.taskId}（当前节点已中止，验收链不会再继续）。用 pi_result 取回完整状态。`);
+				}
+				// ② 排队中的任务：出队即可，不必等它拿到槽位
 				if (cancelQueued(args.taskId)) {
 					const qn = nodes.get(args.taskId);
 					qn?.kill();
@@ -588,6 +897,7 @@ async function cli() {
 		const task = rest.filter((x) => !x.startsWith("--")).join(" ");
 		const dir = flag("dir") || process.cwd();
 		const model = flag("model");
+		const isAsync = flag("async") === "true";
 		const out = await execute({
 			task,
 			workdir: dir,
@@ -599,8 +909,18 @@ async function cli() {
 			escalate: flag("escalate") !== "false", // 默认升档；--escalate=false 关闭
 			scope: flag("scope") ? flag("scope").split(",") : undefined,
 			mode: flag("mode"),
+			async: isAsync,
 		});
 		console.log(out.content[0].text);
+		// 异步模式：CLI 进程退出后后台任务也随之结束（进程绑定），故提示用 --wait 或走 MCP
+		if (isAsync) {
+			const m = out.content[0].text.match(/taskId: (t-\S+)/);
+			if (m) {
+				const waitMs = flag("wait") ? Number(flag("wait")) : 0;
+				const r = await piResult({ taskId: m[1], waitMs: waitMs || 600000 });
+				console.log("\n" + r.content[0].text);
+			}
+		}
 		process.exit(0);
 	}
 	console.log(`pi-bridge
