@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 单元测试 + 协议冒烟（Node ${{ matrix.node }} / ${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 验收层单元测试（不跑模型，秒级）
+        run: npm test
+
+      - name: MCP 协议冒烟（握手 + 工具列表）
+        run: npm run smoke
+
+      - name: 配置层自检（无个人环境的冷启动验证）
+        run: node -e "import('./src/config.js').then(c=>{const d=c.describeConfig();console.log(JSON.stringify(d,null,2));if(!d.piExe)process.exit(1)})"
+
+  lint:
+    name: 语法检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 所有源文件语法校验
+        run: |
+          for f in src/*.js tests/*.js; do
+            node --check "$f" || exit 1
+          done
+          echo "✅ 全部源文件语法正确"
+
+  no-hardcoded-paths:
+    name: 硬编码路径守卫
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 确保没有混入个人环境路径
+        run: |
+          # 这个仓库的设计前提是「可移植」——个人路径绝不该出现
+          if grep -rn -e '/Users/' -e 'D:\\llm' -e 'agent1super' src/ tests/ 2>/dev/null | grep -v '对照 D:/llm/pi/docs'; then
+            echo "❌ 发现个人环境路径引用，违反可移植性设计"
+            exit 1
+          fi
+          echo "✅ 无个人环境硬编码"
