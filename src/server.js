@@ -30,7 +30,7 @@ import {
 	MODEL_ALIASES,
 } from "./models.js";
 import { runVerify, snapshot, diffSnapshots, checkScope, buildReworkPrompt, buildEvidence } from "./verify.js";
-import { MAX_CONCURRENT as CFG_MAX_CONCURRENT, DEFAULT_TIMEOUT_MS } from "./config.js";
+import { MAX_CONCURRENT as CFG_MAX_CONCURRENT, DEFAULT_TIMEOUT_MS, VERSION } from "./config.js";
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
@@ -868,7 +868,7 @@ async function execute(args) {
 // —— MCP 模式 ——
 async function main() {
 	const server = new Server(
-		{ name: "pi-bridge", version: "0.1.0" },
+		{ name: "pi-bridge", version: VERSION },
 		{ capabilities: { tools: {} } },
 	);
 

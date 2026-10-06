@@ -22,9 +22,13 @@ import { dirname } from "node:path";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "_ut_" + Date.now());
 const isWin = process.platform === "win32";
-// ⚠️ Windows 陷阱：命令走 `cmd /d /s /c <cmd>`，若 cmd 里再给整条命令套外层引号，
-// cmd 会剥掉首尾引号导致解析错乱（实测 exit=1）。所以这里用相对路径、不加引号。
+// ★ 2026-10-06 起，Windows 上**带引号的命令也能用**（runVerify 已根治，见 src/verify.js 文件头）。
+//   旧版这里是「别用引号」的规避建议 —— 绕路的代价是：验收命令只要写了带引号的路径，
+//   就被恒定判失败（文件明明在），于是模型交出的成果被误判成没做。
+//   两个 helper 故意并存：无引号写法与带引号写法**都必须对**，
+//   谁哪天再把引号弄坏，下面第 1b 段立刻红。
 const existsCmd = (p) => (isWin ? `if exist ${p} (exit 0) else (exit 1)` : `test -f "${p}"`);
+const quotedExistsCmd = (p) => (isWin ? `if exist "${p}" (exit 0) else (exit 1)` : `test -f "${p}"`);
 
 rmSync(ROOT, { recursive: true, force: true });
 mkdirSync(join(ROOT, "allowed"), { recursive: true });
@@ -45,6 +49,24 @@ const r2 = await runVerify(existsCmd("nope.txt"), ROOT);
 ok(r2?.passed === false, "不存在的文件 → 不通过", `exit=${r2?.exitCode}`);
 const r3 = await runVerify(null, ROOT);
 ok(r3 === null, "未提供命令 → 返回 null（不验收）");
+
+console.log("\n=== 1b. 带引号 / 内嵌引号的命令（★回归：Windows 曾因 Node 转义引号而误判）===");
+// 这一段的由来（2026-10-06 实测）：runVerify 旧写法在 Windows 上把命令里的 `"` 破坏掉，
+// 造成两种误判，都是「验收门看起来在工作、实际没在工作」：
+//   ① 假失败：`if exist "带空格 的路径"` —— 文件明明存在，却恒定 exit 1
+//      （真实影响：多个已产出成果的任务被误判「验收未通过」，白触发返工）
+//   ② 假通过：`node -e "process.exit(3)"` —— 明明该失败，却报通过
+//      （引号被破坏后 Node 收到的是字符串字面量 `"process.exit(3)"`：合法 JS、什么都不做、退出 0）
+// ②比①危险得多：一道该拦错误的门，反过来给错误放行。
+writeFileSync(join(ROOT, "has space.txt"), "x");
+const q1 = await runVerify(quotedExistsCmd("has space.txt"), ROOT);
+ok(q1?.passed === true, "带引号路径 + 文件存在 → 通过（旧版恒判失败）", `exit=${q1?.exitCode}`);
+const q2 = await runVerify(quotedExistsCmd("no such file.txt"), ROOT);
+ok(q2?.passed === false, "带引号路径 + 文件不存在 → 不通过", `exit=${q2?.exitCode}`);
+const q3 = await runVerify('node -e "process.exit(3)"', ROOT);
+ok(q3?.passed === false, "内嵌引号命令 exit 3 → 不通过（旧版误判通过）", `exit=${q3?.exitCode}`);
+const q4 = await runVerify('node -e "process.exit(0)"', ROOT);
+ok(q4?.passed === true, "内嵌引号命令 exit 0 → 通过", `exit=${q4?.exitCode}`);
 
 console.log("\n=== 2. 快照 diff ===");
 const s1 = snapshot(ROOT);

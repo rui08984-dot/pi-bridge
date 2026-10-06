@@ -85,6 +85,14 @@ export const VERIFY_SHELL_ARGS = isWin ? [" /d", "/s", "/c"] : ["-c"];
 /** 本地引擎并发闸门（占显存的那些）。云端不限。 */
 export const MAX_CONCURRENT = Number(pick("maxConcurrent", "PI_BRIDGE_CONCURRENCY", 1));
 
+/**
+ * 包版本 —— 从 package.json 读，**不写死**。
+ * ★为什么：MCP 客户端在握手时会看到 serverInfo.version。原先 server.js 里写死 "0.1.0"，
+ *   而 package.json 早已是 0.2.0 —— 两边一漂移，客户端报出的版本就是错的。
+ *   版本只有一个真源（package.json），其余一律派生。
+ */
+export const VERSION = readJsonSafe(join(PKG_ROOT, "package.json")).version || "0.0.0";
+
 /** 默认单任务超时（毫秒）。 */
 export const DEFAULT_TIMEOUT_MS = Number(pick("timeoutMs", "PI_BRIDGE_TIMEOUT_MS", 600000));
 
@@ -94,6 +102,7 @@ export const CONFIG_PATH_RESOLVED = CONFIG_PATH;
 /** 诊断用：打印当前生效配置（隐藏敏感项）。 */
 export function describeConfig() {
 	return {
+		version: VERSION,
 		configSource: CONFIG_SOURCE,
 		piExe: PI_EXE,
 		nodeBin: NODE_BIN,

@@ -20,20 +20,45 @@ const execFileAsync = promisify(execFile);
  * 跨平台：Windows 走 cmd.exe /d /s /c，类 Unix 走 /bin/sh -c。
  * 命令里可以用各自平台的语法（Windows: `if exist`；POSIX: `test -f`）。
  *
- * ⚠️ Windows 实测坑：命令是作为单个 argv 传给 `cmd /d /s /c` 的，
- * 其中的引号会被 cmd 的 /S 规则重解析。实测 `if exist "a.txt" (exit 0)…` **失败**（exit=1），
- * 而去掉引号的 `if exist a.txt (exit 0)…` 正常。建议：用相对路径且不加引号；
- * 路径含空格时改用 `cd /d "目录" && 命令` 的形式。
+ * ★★ Windows 引号问题：已**根治**，不再是限制（2026-10-06）★★
+ *
+ * 旧版在这里留了一段「实测坑」的规避建议（别用引号 / 用 `cd /d "目录" &&`）。
+ * 那是绕路，不是修路 —— 后果是**验收命令一写带引号的路径就被误判**：
+ *   · 假失败：`if exist "有空格 的路径"` 文件明明在，却恒定 exit 1
+ *     ⇒ 模型交出的成果被误判成没做，白白触发返工
+ *   · 假通过（更危险）：`node -e "process.exit(3)"` 明明该失败，却报通过
+ *     ⇒ 因为引号被破坏后 Node 收到的是字符串字面量 `"process.exit(3)"`
+ *        ——合法 JS、什么都不做、退出 0。一道该拦错误门，反过来给错误放行。
+ *
+ * 根因：Windows 上 Node 按 MSVCRT 规则给参数加引号/转义（`"` → `\"`），
+ *   而 **cmd.exe 不认 `\"`**，命令里的引号被破坏。调用形如
+ *   `execFile(cmd, ["/d","/s","/c", command])` —— cmd 的 /s 规则是
+ *   「整串以引号开头就剥掉首尾引号」，命令**内部**的引号没人保护。
+ *
+ * 修法（两条缺一不可，实测缺一即错）：
+ *   ① 整条命令**再包一层引号** —— 配合 /s 的剥离规则，内部引号才活下来；
+ *   ② `windowsVerbatimArguments: true` —— 让 Node 原样传参、不做转义。
+ *
+ * 实测（13 例对照，见仓库 tests/verify-unit.js 的「1b」段）：
+ *   旧写法 7/13 ｜ 只加 ② 12/13（命令以引号开头那类仍错）｜ ①+② **13/13**
+ *
+ * ⚠️ 只在 shell 确实是 cmd.exe 时才套引号 —— POSIX 的 sh -c 本来就不用它，
+ *    硬套反而会多一层语法错误。同理 windowsVerbatimArguments 在 Unix 上是空操作，
+ *    一并按平台收口，免得有人把 Windows 的 verifyShell 配成 bash 时踩雷。
  */
 export async function runVerify(command, cwd, timeoutMs = 120000) {
 	if (!command) return null;
+	const viaCmd = process.platform === "win32" && /(^|[\\/])cmd(\.exe)?$/i.test(VERIFY_SHELL);
 	try {
-		const { stdout, stderr } = await execFileAsync(VERIFY_SHELL, [...VERIFY_SHELL_ARGS, command], {
+		const args = viaCmd ? [...VERIFY_SHELL_ARGS, '"' + command + '"'] : [...VERIFY_SHELL_ARGS, command];
+		const opts = {
 			cwd,
 			timeout: timeoutMs,
 			windowsHide: true,
 			maxBuffer: 8 * 1024 * 1024,
-		});
+		};
+		if (viaCmd) opts.windowsVerbatimArguments = true; // 不让 Node 转义引号
+		const { stdout, stderr } = await execFileAsync(VERIFY_SHELL, args, opts);
 		const out = ((stdout || "") + (stderr || "")).trim();
 		return { command, passed: true, exitCode: 0, output: out.slice(-4000) };
 	} catch (err) {
